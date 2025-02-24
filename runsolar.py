@@ -40,7 +40,7 @@ def run_script(script_path):
 def main():
     # List of scripts to run in order
     scripts = [
-        "preprocessing_solar.py",
+        "preprocessing_solar.py",  
         "solar_analysis.py",
         "solar_mapping.py"
     ]

@@ -300,11 +300,6 @@ if __name__ == "__main__":
 
     # Create and save the map
     solar_map = create_detailed_solar_map(analyzed_buildings, analyzed_points)
-    map_file = solarwebmap_deploy_dir / 'solar_potential_map.html'
+    map_file = solarwebmap_deploy_dir / 'SolarPotential.html'
     solar_map.save(str(map_file))
     print(f"\nInteractive map saved to {map_file}")
-
-    # Copy as index.html
-    index_file = solarwebmap_deploy_dir / 'index.html'
-    shutil.copy(str(map_file), str(index_file))
-    print(f"Webmap deployed at {index_file}")

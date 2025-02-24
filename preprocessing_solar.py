@@ -22,8 +22,28 @@ TARGET_CRS = 'EPSG:6539'
 # Minimum parking lot area (sq ft)
 MIN_PARKING_AREA = 5000
 
-# Function to print dataset information
+# Toggle whether to include parking lots in final output
+INCLUDE_PARKING = False  # Set to False to exclude parking lots
+
+# Dictionary of data files
+data_files = {
+    'nsi': {'path': INPUT_FOLDER / 'NYC_NSI.geojson', 'columns': None},
+    'lots': {'path': INPUT_FOLDER / 'MapPLUTO.geojson', 'columns': None},
+    'pofw': {'path': INPUT_FOLDER / 'NYC_POFW.geojson', 'columns': None},
+    'buildings': {'path': INPUT_FOLDER / 'NYC_Buildings.geojson', 'columns': None},
+    'facilities': {'path': INPUT_FOLDER / 'NYC_Facilities.geojson', 'columns': None},
+}
+
+# Initialize empty dictionaries and lists
+datasets = {}
+temp_files = []
+
+
+# ---------- DATASET-LOADING HELPERS ---------- #
 def print_dataset_info(name, data):
+    """
+    Print summary information about a loaded dataset.
+    """
     print(f"\n=== {name} Dataset ===")
     if isinstance(data, gpd.GeoDataFrame):
         print("\nColumns:")
@@ -43,8 +63,10 @@ def print_dataset_info(name, data):
     else:
         print("No data loaded or invalid data format.")
 
-# Function to load and reproject GeoJSON if needed
 def load_geojson(file_path, columns=None):
+    """
+    Load a GeoJSON file into a GeoDataFrame and reproject if needed.
+    """
     try:
         gdf = gpd.read_file(
             file_path,
@@ -65,8 +87,11 @@ def load_geojson(file_path, columns=None):
         print(f"Error loading {file_path}: {e}")
         return None
 
-# Function to load and reproject raster if needed
 def load_raster(file_path):
+    """
+    Load a raster file. If it's not in the target CRS, reproject on the fly
+    and return a handle to the reprojected file.
+    """
     try:
         with rasterio.open(file_path) as src:
             # Check if reprojection is needed
@@ -105,24 +130,213 @@ def load_raster(file_path):
         print(f"Error loading {file_path}: {e}")
         return None
 
-# Dictionary of data files
-data_files = {
-    'nsi': {'path': INPUT_FOLDER / 'NYC_NSI.geojson', 'columns': None},
-    'firehouses': {'path': INPUT_FOLDER / 'FDNY_Firehouse.geojson', 'columns': None},
-    'lots': {'path': INPUT_FOLDER / 'MapPLUTO.geojson', 'columns': None},
-    'pofw': {'path': INPUT_FOLDER / 'NYC_POFW.geojson', 'columns': None},
-    'buildings': {'path': INPUT_FOLDER / 'NYC_Buildings.geojson', 'columns': None},
-    'pois': {'path': INPUT_FOLDER / 'NYC_POIS.geojson', 'columns': None},
-    'libraries': {'path': INPUT_FOLDER / 'NYC_Libraries.geojson', 'columns': None},
-    'schools': {'path': INPUT_FOLDER / 'NYC_Schools.geojson', 'columns': None},
-    'busdepots': {'path': INPUT_FOLDER / 'NYC_BusDepots.geojson', 'columns': None},
-    'policestations': {'path': INPUT_FOLDER / 'NYC_PoliceStations.geojson', 'columns': None},
-    'postoffices': {'path': INPUT_FOLDER / 'NYC_PostOffices.geojson', 'columns': None},
-}
 
-datasets = {}
-temp_files = []
+# ---------- GEOMETRY CLEANUP HELPERS ---------- #
+def clean_and_validate_geometry(gdf):
+    """
+    Clean and validate geometries in a GeoDataFrame by making them valid
+    and removing invalid or empty rows.
+    """
+    # Make valid geometries and buffer by tiny amount to fix topology
+    gdf.geometry = gdf.geometry.make_valid().buffer(0.01).buffer(-0.01)
 
+    # Remove empty or invalid geometries
+    gdf = gdf[~gdf.geometry.is_empty & gdf.geometry.is_valid]
+
+    # Ensure all geometries are polygons or multipolygons
+    gdf = gdf[gdf.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+
+    return gdf
+
+def explode_multipart_features(gdf):
+    """
+    Explode multipart features into single part features.
+    """
+    exploded = gdf.explode(index_parts=True)
+    exploded = exploded.reset_index(drop=True)
+    return exploded
+
+def safe_dissolve(gdf, dissolve_field):
+    """
+    Safely dissolve geometries while handling topology errors.
+    """
+    try:
+        groups = gdf.groupby(dissolve_field)
+        dissolved_parts = []
+
+        for name, group in groups:
+            # Clean group geometries
+            group = clean_and_validate_geometry(group)
+            if len(group) > 0:
+                # Union geometries within group
+                unified = group.geometry.unary_union
+
+                # Create new GeoDataFrame with dissolved geometry
+                dissolved_part = gpd.GeoDataFrame(
+                    {dissolve_field: [name]},
+                    geometry=[unified],
+                    crs=group.crs
+                )
+                dissolved_part = explode_multipart_features(dissolved_part)
+                dissolved_parts.append(dissolved_part)
+
+        if dissolved_parts:
+            result = pd.concat(dissolved_parts, ignore_index=True)
+            return clean_and_validate_geometry(result)
+        return gdf
+
+    except Exception as e:
+        print(f"Error during dissolve operation: {e}")
+        return gdf
+
+
+# ---------- DATA PROCESSING FUNCTIONS ---------- #
+def process_facilities(gdf):
+    """
+    Prepare the NYC_Facilities dataset.
+    Only includes specific FACTYPEs.
+    """
+    print("\nPrepare NYC Facilities...")
+
+    # Define allowed facility types
+    allowed_factypes = {
+        'OTHER SCHOOL - NON-PUBLIC', 'COMMUNITY SERVICES',
+        'ELEMENTARY SCHOOL - PUBLIC', 'CHARTER SCHOOL',
+        'COMPASS ELEMENTARY', 'LICENSED PRIVATE SCHOOLS', 'PUBLIC LIBRARY', 'FIREHOUSE',
+        'NURSING HOME', 'VISUAL ARTS', 'K-8 SCHOOL - PUBLIC', 'TRANSIT FACILITY',
+        'MUSEUM', 'SCHOOL BUS DEPOT', 'TRANSPORTATION FACILITY',
+        'NYCHA COMMUNITY CENTER - COMMUNITY CENTER - CORNERSTONE',
+        'ELEMENTARY SCHOOL - CHARTER', 'K-8 SCHOOL - CHARTER',
+        'PRE-SCHOOL FOR STUDENTS WITH DISABILITIES',
+        'POLICE STATION', 'COMBINED MAINTENANCE/STORAGE FACILITY', 'HOSPITAL',
+         'ADULT HOME', 'SENIORS', 'MANNED TRANSPORTATION FACILITY',
+        'TRANSIT SUBSTATION', 'WASTEWATER PUMPING STATION', 'TRANSIT YARD',
+        'NYCT SUBWAY YARD', 'MALL', 'MTA BUS DEPOT', 'TRANSFER STATION',
+        'NYCT MAINTENANCE AND OTHER FACILITY', 
+        'INDOOR STORAGE (WAREHOUSE)', 'WASTEWATER TREATMENT PLANT',
+        'INDOOR STORAGE - EQUIPMENT', 'LIRR MAINTENANCE AND OTHER FACILITY',
+        'SOLID WASTE LANDFILL'
+    }
+
+    # Filter for allowed facility types
+    gdf = gdf[gdf['FACTYPE'].isin(allowed_factypes)]
+
+    # Just ensure fclass and name columns exist
+    if 'fclass' not in gdf.columns:
+        gdf['fclass'] = gdf['FACTYPE'].fillna('Facilities')
+
+    # Create a 'name' column if it doesn't exist
+    if 'FACNAME' in gdf.columns:
+        gdf['name'] = gdf['FACNAME'].fillna('Unknown')
+    else:
+        gdf['name'] = 'Unknown'
+
+    # Ensure standard columns exist; fill if missing
+    text_cols = ['FACTYPE', 'FACSUBGRP', 'FACGROUP', 'FACDOMAIN',
+                 'OPNAME', 'OPABBREV', 'OPTYPE']
+    for col in text_cols:
+        if col not in gdf.columns:
+            gdf[col] = 'Unknown'
+
+    # For numeric columns that appear in the final output, fill with 0 if missing
+    if 'CAPACITY' not in gdf.columns:
+        gdf['CAPACITY'] = 0
+
+    # Keep only these columns + geometry
+    keep_cols = [
+        'geometry', 'fclass', 'name',
+        'FACTYPE', 'FACSUBGRP', 'FACGROUP', 'FACDOMAIN',
+        'OPNAME', 'OPABBREV', 'OPTYPE', 'CAPACITY'
+    ]
+    existing_cols = [c for c in keep_cols if c in gdf.columns]
+    gdf = gdf[existing_cols]
+
+    print("\nFacility counts by FACTYPE:")
+    print(gdf['FACTYPE'].value_counts(dropna=False))
+    print(f"\nTotal number of facilities: {len(gdf)}")
+    return gdf
+
+
+def process_pofw(gdf):
+    """
+    Prepare places of worship.
+    Retain them all and add the standard columns so they can merge with Facilities.
+    """
+    print("\nPrepare OSM Places of Worship...")
+
+    # If 'fclass' not present, set it to "OSM_POFW"
+    if 'fclass' not in gdf.columns:
+        gdf['fclass'] = 'OSM_POFW'
+    else:
+        gdf['fclass'] = 'OSM_POFW'  # standardize
+
+    # Ensure a 'name' column
+    if 'name' not in gdf.columns:
+        gdf['name'] = 'Unknown'
+    else:
+        gdf['name'] = gdf['name'].fillna('Unknown')
+
+    # Make sure the facility-related columns exist (fill with 'Unknown' or 0)
+    text_columns = ['FACTYPE', 'FACSUBGRP', 'FACGROUP', 'FACDOMAIN',
+                    'OPNAME', 'OPABBREV', 'OPTYPE']
+    for col in text_columns:
+        gdf[col] = 'Unknown'
+
+    gdf['CAPACITY'] = 0  # numeric column in final
+    # Keep the geometry and columns consistent with Facilities
+    keep_cols = [
+        'geometry', 'fclass', 'name',
+        'FACTYPE', 'FACSUBGRP', 'FACGROUP', 'FACDOMAIN',
+        'OPNAME', 'OPABBREV', 'OPTYPE', 'CAPACITY'
+    ]
+    gdf = gdf[keep_cols]
+
+    print(f"Number of places of worship: {len(gdf)}")
+    return gdf
+
+def merge_point_datasets(datasets):
+    """
+    Merge the Facilities dataset with the POFW dataset into a single
+    GeoDataFrame of 'points' that we can then join with PLUTO & building footprints.
+    """
+    print("\nMerge points datasets...")
+
+    required_columns = [
+        'fclass', 'name', 'FACTYPE', 'FACSUBGRP', 'FACGROUP', 'FACDOMAIN',
+        'OPNAME', 'OPABBREV', 'OPTYPE', 'CAPACITY', 'geometry'
+    ]
+
+    points_dfs = []
+    for key in ['pofw', 'facilities']:
+        if key in datasets and datasets[key] is not None:
+            df = datasets[key]
+            # Check if the df has all required columns; if not, skip
+            missing_cols = [col for col in required_columns if col not in df.columns]
+            if missing_cols:
+                print(f"Warning: {key} is missing columns: {missing_cols}")
+                continue
+            points_dfs.append(df[required_columns])
+
+    if not points_dfs:
+        print("No valid datasets to merge!")
+        return gpd.GeoDataFrame(columns=required_columns, crs=TARGET_CRS)
+
+    # Concatenate them
+    merged_pts = pd.concat(points_dfs, ignore_index=True)
+
+    # Add an ObjectID
+    merged_pts['ObjectID'] = merged_pts.index + 1
+
+    # Print some summary info
+    print("\nColumns in merged dataset:", merged_pts.columns.tolist())
+    print("\nCount by fclass:")
+    print(merged_pts['fclass'].value_counts(dropna=False))
+    print(f"\nTotal points from facilities + places of worship: {len(merged_pts)}")
+
+    return gpd.GeoDataFrame(merged_pts, geometry='geometry', crs=TARGET_CRS)
+
+
+# ---------- MAIN PROCESSING BLOCK ---------- #
 if not INPUT_FOLDER.exists():
     raise FileNotFoundError(f"Input folder not found at: {INPUT_FOLDER}")
 
@@ -131,7 +345,7 @@ n_cores = max(1, mp.cpu_count() - 1)
 try:
     total_start_time = time.time()
 
-    # Load all datasets
+    # 1) Load all datasets
     for key, file_info in data_files.items():
         file_path = file_info['path']
         columns = file_info['columns']
@@ -142,292 +356,199 @@ try:
             datasets[key] = load_geojson(file_path, columns)
         elif file_path.suffix == '.tif':
             datasets[key] = load_raster(file_path)
+            # If a reprojected raster is created, keep track of the temp file
             if datasets[key] is not None and datasets[key].name != str(file_path):
                 temp_files.append(Path(datasets[key].name))
-        
-        end_time = time.time()
-        duration = end_time - start_time
-        print(f"Loading time for {key} ({file_path.name}): {timedelta(seconds=duration)}")
 
-        # Print immediate summary after loading each dataset
+        duration = time.time() - start_time
+        print(f"Loading time for {key}: {timedelta(seconds=duration)}")
+
+        # Print immediate summary
         if datasets[key] is not None:
             if isinstance(datasets[key], gpd.GeoDataFrame):
-                print(f"{key} loaded with {len(datasets[key])} features.")
-            elif isinstance(datasets[key], rasterio.DatasetReader):
-                print(f"{key} loaded as a raster with {datasets[key].count} bands.")
+                print_dataset_info(key, datasets[key])
             else:
-                print(f"{key} loaded but no recognizable format.")
+                print(f"{key} loaded but not a GeoDataFrame.")
         else:
             print(f"{key} dataset could not be loaded or is empty.")
 
-    # Print information for all datasets
-    print("\n=== DATASET SUMMARIES ===")
-    for name, data in datasets.items():
-        print_dataset_info(name, data)
+    # 2) Process Facilities (keep them all)
+    if 'facilities' in datasets and datasets['facilities'] is not None:
+        datasets['facilities'] = process_facilities(datasets['facilities'])
 
-    # Prepare POIs
-    print("\nPrepare places of interest...")
-    pois = datasets['pois']
-    if pois is not None:
-        print(f"Number of points in original POIs dataset: {len(pois)}")
-        typologies = ['arts_centre', 'college', 'community_centre', 'shelter']
-        pois = pois[pois['fclass'].isin(typologies)].copy()
-        keep_cols = ['fclass', 'name', 'geometry']
-        pois = pois[keep_cols]
-        print(f"Number of points in filtered POIs dataset: {len(pois)}")
-        datasets['pois'] = pois
+    # 3) Process POFW (keep them all)
+    if 'pofw' in datasets and datasets['pofw'] is not None:
+        datasets['pofw'] = process_pofw(datasets['pofw'])
 
-    # POFW
-    print("\nPrepare places of worship...")
-    pofw = datasets['pofw']
-    if pofw is not None:
-        pofw['fclass'] = 'pofw_' + pofw['fclass'].astype(str)
-        pofw['name'] = pofw['name'].fillna('Unknown')
-        pofw = pofw[['fclass', 'name', 'geometry']]
-        print(f"Number of points in filtered POFW dataset: {len(pofw)}")
-        datasets['pofw'] = pofw
+    # 4) Merge Facilities + POFW
+    bldg_pts = merge_point_datasets(datasets)
 
-    # Firehouses
-    print("\nPrepare firehouses...")
-    firehouses = datasets['firehouses']
-    if firehouses is not None:
-        firehouses['fclass'] = "Firehouse"
-        firehouses['name'] = firehouses['FacilityName']
-        firehouses = firehouses[['fclass', 'name', 'geometry']]
-        print(f"Number of firehouses in prepared dataset: {len(firehouses)}")
-        datasets['firehouses'] = firehouses
+    # 5) Extract data from PLUTO ("lots") into those points
+    print("\nExtract data from lots (PLUTO)...")
+    lots = datasets.get('lots')
+    if lots is not None and not bldg_pts.empty:
+        lot_fields = [
+            'Address', 'BldgClass', 'OwnerName', 'LotArea', 'BldgArea', 'ComArea',
+            'ResArea', 'OfficeArea', 'RetailArea', 'GarageArea', 'StrgeArea',
+            'BuiltFAR', 'ResidFAR', 'CommFAR', 'FacilFAR', 'LandUse'
+        ]
+        # Only join if these columns exist in PLUTO
+        existing_lot_fields = [f for f in lot_fields if f in lots.columns]
 
-    # Libraries
-    print("\nPrepare libraries...")
-    libraries = datasets['libraries']
-    if libraries is not None:
-        libraries['fclass'] = "Library"
-        libraries['name'] = libraries['NAME']
-        libraries = libraries[['fclass', 'name', 'geometry']]
-        print(f"Number of libraries in prepared dataset: {len(libraries)}")
-        datasets['libraries'] = libraries
-
-    # Schools
-    print("\nPrepare schools...")
-    schools = datasets['schools']
-    if schools is not None:
-        schools['fclass'] = "School"
-        schools['name'] = schools['Name']
-        schools = schools[['fclass', 'name', 'geometry']]
-        print(f"Number of schools in prepared dataset: {len(schools)}")
-        datasets['schools'] = schools
-
-    # Busdepots
-    print("\nPrepare busdepots...")
-    busdepots = datasets['busdepots']
-    if busdepots is not None:
-        busdepots['fclass'] = "Bus Depot"
-        busdepots['name'] = busdepots['FACNAME']
-        busdepots = busdepots[['fclass', 'name', 'geometry']]
-        print(f"Number of busdepots in prepared dataset: {len(busdepots)}")
-        datasets['busdepots'] = busdepots
-
-    # Policestations
-    print("\nPrepare policestations...")
-    policestations = datasets['policestations']
-    if policestations is not None:
-        policestations['fclass'] = policestations['FACSUBGRP']
-        policestations['name'] = "Police Station"
-        policestations = policestations[['fclass', 'name', 'geometry']]
-        print(f"Number of policestations in prepared dataset: {len(policestations)}")
-        datasets['policestations'] = policestations
-
-    # Postoffices
-    print("\nPrepare postoffices...")
-    postoffices = datasets['postoffices']
-    if postoffices is not None:
-        postoffices['fclass'] = "Post Office"
-        postoffices = postoffices[['fclass', 'name', 'geometry']]
-        print(f"Number of postoffices in prepared dataset: {len(postoffices)}")
-        datasets['postoffices'] = postoffices
-
-    # Merge Points Datasets
-    print("\nMerge points datasets...")
-    points_keys = ['pois', 'pofw', 'firehouses', 'libraries', 'schools', 'busdepots', 'policestations', 'postoffices']
-    points_dfs = [datasets.get(k) for k in points_keys if datasets.get(k) is not None]
-
-    required_columns = ['fclass', 'name', 'geometry']
-    for df in points_dfs:
-        if not all(col in df.columns for col in required_columns):
-            raise ValueError("One of the point datasets does not contain the required columns.")
-
-    if len(points_dfs) > 0:
-        bldg_pts = pd.concat(points_dfs, ignore_index=True)[required_columns]
-        bldg_pts['ObjectID'] = bldg_pts.index + 1
-        print("Columns in merged dataset:", bldg_pts.columns.tolist())
-        print("\nCount by fclass:")
-        print(bldg_pts['fclass'].value_counts())
-        print(f"Total building points: {len(bldg_pts)}")
-    else:
-        bldg_pts = gpd.GeoDataFrame(columns=required_columns + ['ObjectID'], crs=TARGET_CRS)
-
-    bldg_pts = gpd.GeoDataFrame(bldg_pts, geometry='geometry', crs=TARGET_CRS)
-
-    # Extract data from lots
-    print("\nExtract data from lots...")
-    lots = datasets['lots']
-    if lots is not None and len(bldg_pts) > 0:
-        lot_fields = ['Address', 'BldgClass', 'OwnerName', 'LotArea', 'BldgArea', 'ComArea',
-                      'ResArea', 'OfficeArea', 'RetailArea', 'GarageArea', 'StrgeArea',
-                      'BuiltFAR', 'ResidFAR', 'CommFAR', 'FacilFAR']
-        bldg_pts = gpd.sjoin(bldg_pts, lots[lot_fields + ['geometry']], how='left', predicate='within')
+        # Spatial join for points
+        bldg_pts = gpd.sjoin(
+            bldg_pts, 
+            lots[existing_lot_fields + ['geometry']], 
+            how='left', 
+            predicate='within'
+        )
         if 'index_right' in bldg_pts.columns:
             bldg_pts.drop(columns=['index_right'], inplace=True)
 
         matched = bldg_pts[~bldg_pts['Address'].isna()].shape[0]
         unmatched = bldg_pts[bldg_pts['Address'].isna()].shape[0]
-        print(f"Points successfully extracted data from lots: {matched}")
-        print(f"Points did not extract data from lots: {unmatched}")
+        print(f"Points successfully extracted data from PLUTO: {matched}")
+        print(f"Points did not extract data from PLUTO: {unmatched}")
 
-    # Combine points data with building footprints
+    # 6) Combine points data with building footprints
     print("\nCombine points data with building footprints...")
-    buildings = datasets['buildings']
-    if buildings is not None and len(bldg_pts) > 0:
-        buildings = buildings[['geometry', 'groundelev', 'heightroof', 'lststatype', 'cnstrct_yr']]
+    buildings = datasets.get('buildings')
+    if buildings is not None and not bldg_pts.empty:
+        # Keep only essential columns in buildings
+        bldg_fields = ['geometry', 'groundelev', 'heightroof', 'lststatype', 'cnstrct_yr']
+        existing_bldg_fields = [f for f in bldg_fields if f in buildings.columns]
+        buildings = buildings[existing_bldg_fields]
+
         joined = gpd.sjoin(buildings, bldg_pts, how='inner', predicate='contains')
         print("Columns in joined after sjoin:", joined.columns)
-
-        agg_fields = [
-            'fclass', 'name', 'Address', 'BldgClass', 'OwnerName', 'LotArea', 'BldgArea', 
-            'ComArea', 'ResArea', 'OfficeArea', 'RetailArea', 'GarageArea', 'StrgeArea', 
-            'BuiltFAR', 'ResidFAR', 'CommFAR', 'FacilFAR'
-        ]
 
         def combine_values(series):
             vals = series.dropna().unique()
             return ' + '.join(map(str, vals)) if len(vals) > 0 else np.nan
 
+        # We'll aggregate everything in bldg_pts that we want to keep
+        agg_fields = [
+            'fclass', 'name', 'Address', 'BldgClass', 'OwnerName', 'LotArea', 'BldgArea', 
+            'ComArea', 'ResArea', 'OfficeArea', 'RetailArea', 'GarageArea', 'StrgeArea', 
+            'BuiltFAR', 'ResidFAR', 'CommFAR', 'FacilFAR',
+            'FACTYPE', 'FACSUBGRP', 'FACGROUP', 'FACDOMAIN', 
+            'OPNAME', 'OPABBREV', 'OPTYPE', 'CAPACITY', 'LandUse'
+        ]
+        # Only aggregate fields that exist in the joined data
         agg_fields = [f for f in agg_fields if f in joined.columns]
+
         if agg_fields:
             grouped = joined.groupby(joined.index)
             agg_dict = {f: combine_values for f in agg_fields}
+            if 'CAPACITY' in joined.columns:
+                agg_dict['CAPACITY'] = 'sum'  # numeric sum for capacity
+
             agg_result = grouped.agg(agg_dict)
-            buildings = buildings.loc[agg_result.index]
+            buildings = buildings.loc[agg_result.index]  # re-align to grouped index
             for f in agg_fields:
                 buildings[f] = agg_result[f]
 
         datasets['buildings'] = buildings
     else:
-        print("No buildings or points to combine or no overlapping features found.")
+        print("No buildings or point datasets to combine, or no overlaps found.")
 
-    # Extract data from NSI
-    print("\nExtract data from national structures inventory...")
-    nsi = datasets['nsi']
-    if nsi is not None and buildings is not None:
+    # 7) Extract data from NSI
+    print("\nExtract data from national structures inventory (NSI)...")
+    nsi = datasets.get('nsi')
+    if nsi is not None and 'buildings' in datasets and datasets['buildings'] is not None:
+        buildings = datasets['buildings']
         nsi_fields = ['bldgtype', 'num_story', 'found_type', 'found_ht']
-        joined_nsi = gpd.sjoin(buildings, nsi[nsi_fields + ['geometry']], how='left', predicate='contains')
+        existing_nsi = [f for f in nsi_fields if f in nsi.columns]
+        joined_nsi = gpd.sjoin(buildings, nsi[existing_nsi + ['geometry']], 
+                               how='left', predicate='contains')
 
         def combine_values(series):
             vals = series.dropna().unique()
             return ' + '.join(map(str, vals)) if len(vals) > 0 else np.nan
 
-        agg_dict_nsi = {f: combine_values for f in nsi_fields}
+        agg_dict_nsi = {f: combine_values for f in existing_nsi}
         grouped_nsi = joined_nsi.groupby(joined_nsi.index).agg(agg_dict_nsi)
-        for f in nsi_fields:
+        for f in existing_nsi:
             buildings[f] = grouped_nsi[f]
 
-        matched_nsi = buildings[~buildings['bldgtype'].isna()].shape[0]
-        unmatched_nsi = buildings[buildings['bldgtype'].isna()].shape[0]
-        print(f"Buildings successfully extracted data from nsi: {matched_nsi}")
-        print(f"Buildings did not extract data from nsi: {unmatched_nsi}")
+        matched_nsi = 0
+        if 'bldgtype' in buildings.columns:
+            matched_nsi = buildings[~buildings['bldgtype'].isna()].shape[0]
+        unmatched_nsi = buildings.shape[0] - matched_nsi
+        print(f"Buildings successfully extracted data from NSI: {matched_nsi}")
+        print(f"Buildings did not extract data from NSI: {unmatched_nsi}")
 
-    # Isolate parking lots
-    def clean_and_validate_geometry(gdf):
-        """Clean and validate geometries in a GeoDataFrame."""
-        # Make valid geometries and buffer by tiny amount to fix topology
-        gdf.geometry = gdf.geometry.make_valid().buffer(0.01).buffer(-0.01)
-
-        # Remove empty or invalid geometries
-        gdf = gdf[~gdf.geometry.is_empty & gdf.geometry.is_valid]
-
-        # Ensure all geometries are polygons or multipolygons
-        gdf = gdf[gdf.geometry.type.isin(['Polygon', 'MultiPolygon'])]
-
-        return gdf
-
-    def explode_multipart_features(gdf):
-        """Explode multipart features into single part features."""
-        # Explode multipart geometries
-        exploded = gdf.explode(index_parts=True)
-
-        # Reset index and drop the multiindex parts
-        exploded = exploded.reset_index(drop=True)
-
-        return exploded
-
-    def safe_dissolve(gdf, dissolve_field):
-        """Safely dissolve geometries while handling topology."""
-        try:
-            # Group by dissolve field
-            groups = gdf.groupby(dissolve_field)
-            dissolved_parts = []
-
-            for name, group in groups:
-                # Clean group geometries
-                group = clean_and_validate_geometry(group)
-
-                if len(group) > 0:
-                    # Union geometries within group
-                    unified = group.geometry.unary_union
-
-                    # Create new GeoDataFrame with dissolved geometry
-                    dissolved_part = gpd.GeoDataFrame(
-                        {dissolve_field: [name]},
-                        geometry=[unified],
-                        crs=group.crs
-                    )
-
-                    # Explode any multipart features
-                    dissolved_part = explode_multipart_features(dissolved_part)
-                    dissolved_parts.append(dissolved_part)
-
-            # Combine all dissolved parts
-            if dissolved_parts:
-                result = pd.concat(dissolved_parts, ignore_index=True)
-                return clean_and_validate_geometry(result)
-            return gdf
-
-        except Exception as e:
-            print(f"Error during dissolve operation: {e}")
-            return gdf
-
+    # ------------------ PARKING LOTS ------------------ #
+    # Isolate parking lots from PLUTO data...
     print("\nIsolate parking lots from PLUTO data...")
     if lots is not None:
         try:
+            # Ensure LandUse is a string
             lots['LandUse'] = lots['LandUse'].astype(str)
+
+            # LandUse == '10' generally indicates parking
             parking = lots[lots['LandUse'] == '10'].copy()
 
-            # Initial geometry cleaning
-            parking = clean_and_validate_geometry(parking)
-
-            # Filter by area
+            # Filter only large lots, based on a minimum area
             parking = parking[parking['LotArea'] >= MIN_PARKING_AREA].copy()
 
-            parking['fclass'] = "Parking"
-            parking['name'] = parking['Address']
-
-            # Dissolve with improved handling
-            print("Dissolving parking lots...")
-            parking = safe_dissolve(parking, 'OwnerName')
-
-            # Ensure no multipart features
-            parking = explode_multipart_features(parking)
-
-            # Final cleanup
+            # Clean geometries before dissolve
             parking = clean_and_validate_geometry(parking)
 
-            print(f"Number of parking lots and structures (>= {MIN_PARKING_AREA} sq ft): {len(parking)}")
+            # --------------------------------------------------
+            # 1) Assign or copy columns BEFORE dissolve
+            # --------------------------------------------------
+            parking['fclass'] = "Parking"
+            # For name, we might use the Address; fill with Unknown if missing
+            parking['name'] = parking['Address'].fillna('Unknown')
+            
+            # Add fields to match building dataset
+            parking['FACTYPE'] = 'Parking Lot'
+            parking['FACSUBGRP'] = 'Transportation'
+            parking['FACGROUP'] = 'Transportation Infrastructure'
+            parking['FACDOMAIN'] = 'Transportation'
+            parking['OPNAME'] = parking['OwnerName'].fillna('Unknown')
+            parking['OPABBREV'] = 'Unknown'
+            parking['OPTYPE'] = 'Private'
+            parking['CAPACITY'] = 0
 
-            # Verify final geometries
+            print("Dissolving parking lots...")
+            # --------------------------------------------------
+            # 2) DISSOLVE: everything except 'OwnerName' gets lost
+            # --------------------------------------------------
+            parking = safe_dissolve(parking, 'OwnerName')
+
+            # Now 'parking' only has ['OwnerName', 'geometry'] from the dissolve
+
+            # --------------------------------------------------
+            # 3) Reassign columns after dissolve
+            # --------------------------------------------------
+            parking['fclass'] = "Parking"
+            # You can choose any naming convention you like:
+            parking['name'] = "Parking Lot (Dissolved)"
+            
+            # If you want to keep a single address or a single lot area,
+            # you'd need a custom group-by aggregation before dissolving.
+            # For now, we just use a generic placeholder:
+            parking['FACTYPE'] = 'Parking Lot'
+            parking['FACSUBGRP'] = 'Transportation'
+            parking['FACGROUP'] = 'Transportation Infrastructure'
+            parking['FACDOMAIN'] = 'Transportation'
+            parking['OPNAME'] = parking['OwnerName'].fillna('Unknown')
+            parking['OPABBREV'] = 'Unknown'
+            parking['OPTYPE'] = 'Private'
+            parking['CAPACITY'] = 0
+
+            # Continue with explode & clean
+            parking = explode_multipart_features(parking)
+            parking = clean_and_validate_geometry(parking)
+
             invalid_count = sum(~parking.geometry.is_valid)
             if invalid_count > 0:
                 print(f"Warning: {invalid_count} invalid geometries found after processing")
                 parking = parking[parking.geometry.is_valid]
+
+            print(f"Number of parking lots (LandUse=10) >= {MIN_PARKING_AREA} sq ft: {len(parking)}")
 
         except Exception as e:
             print(f"Error processing parking lots: {e}")
@@ -435,52 +556,74 @@ try:
     else:
         parking = gpd.GeoDataFrame(columns=['fclass', 'name', 'geometry'], crs=TARGET_CRS)
 
-        
-    # Merge parking lots and buildings
-    print("\nMerge parking lots and buildings...")
-    # Ensure buildings have an fclass column so that it aligns with parking
-    if buildings is not None:
-        if 'fclass' not in buildings.columns:
-            buildings['fclass'] = 'Building'
+    # 8) Merge parking lots and buildings into a single final dataset
+    print("\nMerge parking lots and buildings into final sites dataset...")
+    # Retrieve the buildings dataset (which has merged building footprints + points)
+    sites = datasets.get('buildings')
+    if sites is None:
+        # If no buildings, create an empty GeoDataFrame with needed columns
+        sites = gpd.GeoDataFrame(
+            columns=[
+                'fclass', 'name', 'geometry', 'FACTYPE', 'FACSUBGRP', 'FACGROUP',
+                'FACDOMAIN', 'OPNAME', 'OPABBREV', 'OPTYPE', 'CAPACITY'
+            ],
+            crs=TARGET_CRS
+        )
+        sites['fclass'] = 'Building'
+
+    # Ensure 'fclass' in buildings
+    if 'fclass' not in sites.columns:
+        sites['fclass'] = 'Building'
+
+    # For merging, ensure both have the same columns
+    required_cols = [
+        'fclass', 'name', 'geometry', 'FACTYPE', 'FACSUBGRP', 'FACGROUP',
+        'FACDOMAIN', 'OPNAME', 'OPABBREV', 'OPTYPE', 'CAPACITY'
+    ]
+    # Add any missing columns in buildings
+    for col in required_cols:
+        if col not in sites.columns and col != 'geometry':
+            # CAPACITY is numeric, all others can be "Unknown"
+            if col == 'CAPACITY':
+                sites[col] = 0
+            else:
+                sites[col] = 'Unknown'
+
+    if INCLUDE_PARKING:
+        # Add any missing columns in parking
+        for col in required_cols:
+            if col not in parking.columns and col != 'geometry':
+                if col == 'CAPACITY':
+                    parking[col] = 0
+                else:
+                    parking[col] = 'Unknown'
+
+        # Conform parking columns to match the buildings
+        parking = parking[required_cols]
+
+        # Combine them
+        sites = pd.concat([sites, parking], ignore_index=True)
+        print(f"Number of sites of interest (Buildings + Parking): {len(sites)}")
     else:
-        # If no buildings, create an empty GeoDataFrame with required columns
-        buildings = gpd.GeoDataFrame(columns=['fclass', 'geometry'], crs=TARGET_CRS)
-        buildings['fclass'] = 'Building'
+        print(f"Number of sites of interest (Buildings only): {len(sites)}")
 
-    # Now we unify parking with buildings based on columns in buildings
-    bldg_fields = set(buildings.columns)
-    parking_fields = set(parking.columns)
-    extra_in_parking = parking_fields - bldg_fields
 
-    # Drop columns from parking that are not in buildings
-    parking = parking.drop(columns=list(extra_in_parking), errors='ignore')
+    # ---------- OUTPUT ---------- #
+    # 1) Shapefile in ./output/shapefiles
+    # 2) GeoJSON in ./output
+    shp_dir = Path("./output/shapefiles")
+    shp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Add missing fields to parking with default 'Unknown'
-    missing_in_parking = bldg_fields - set(parking.columns)
-    for f in missing_in_parking:
-        if f == 'geometry':  # geometry must be present
-            continue
-        if f == 'fclass':
-            # If fclass is missing in parking (it shouldn't be since we set it to 'Parking')
-            # just ensure it is set
-            parking[f] = 'Parking'
-        else:
-            parking[f] = 'Unknown'
-
-    # At this point, parking and buildings have the same columns including fclass
-    parking = parking[buildings.columns]
-
-    # Merge them together
-    sites = pd.concat([buildings, parking], ignore_index=True)
-    print(f"Number of sites of interest: {len(sites)}")
-
-    # Export final sites
-    sites.to_file("./output/shapefiles/preprocessed_sites_solar.shp", driver="ESRI Shapefile")
+    # Write shapefile
+    sites.to_file(shp_dir / "preprocessed_sites_solar.shp", driver="ESRI Shapefile")
+    # Write GeoJSON
     sites.to_file("./output/preprocessed_sites_solar.geojson", driver="GeoJSON")
+
+    print(f"\nFinal sites output: {len(sites)} features.")
 
     total_duration = time.time() - total_start_time
     print(f"\nTotal processing time: {timedelta(seconds=total_duration)}")
-    
+
 except Exception as e:
     print(f"Error occurred: {e}")
 
@@ -490,7 +633,7 @@ finally:
         if isinstance(dataset, rasterio.DatasetReader):
             dataset.close()
 
-    # Clean up temporary files
+    # Clean up temporary reprojected raster files
     for temp_file in temp_files:
         if temp_file.exists():
             try:
