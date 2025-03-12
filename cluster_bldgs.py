@@ -221,7 +221,7 @@ def main():
     
     input_path = './input/buildings.geojson'
     output_geojson = './output/bldgs_dissolved.geojson'
-    output_html = 'webmap.html'
+    output_html = './output/webmap.html'
     
     # Ensure the output directory exists
     os.makedirs(os.path.dirname(output_geojson), exist_ok=True)
