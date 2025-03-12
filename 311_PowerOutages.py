@@ -14,8 +14,8 @@ warnings.filterwarnings('ignore', message='.*not successfully written.*')
 INPUT_FILE = r'C:\Users\olive\One Architecture Dropbox\_NYC PROJECTS\P2415_CSC Year Two\05 GIS\02 Data\00 Sources & Packages\311_Requests\311_Service_Requests_from_2010_to_Present_20240920.csv'
 OUTPUT_FOLDER = r'C:\Users\olive\One Architecture Dropbox\Oliver Atwood\P2415_CSC Year Two\05 GIS\02 Data\01 Vector\311_PowerOutages'
 POWER_OUTAGE_FILE = '311_power_outage_requests.shp'
-YEARS = 5  # Look-back period in years
-POWER_OUTAGE_KEYWORDS = ['power outage', 'blackout', 'electric outage', 'power loss']
+YEARS = 1  # Look-back period in years
+POWER_OUTAGE_KEYWORDS = ['power outage', 'blackout', 'electric outage', 'power loss', 'con ed', 'conedison']
 CHUNK_SIZE = 100000  # Adjust based on available memory
 
 # Column names
