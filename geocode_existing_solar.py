@@ -20,7 +20,7 @@ def geocode_address(address, geolocator, delay=1):
 
 def main():
     # Path to your CSV file
-    csv_path = r"C:\Users\olive\One Architecture Dropbox\_NYC PROJECTS\P2415_CSC Year Two\10 TA Neighborhoods\09 Coney Island Solar\Data\ExistingCommunitySolarProject_NYC.csv"
+    csv_path = r"./input/ExistingCommunitySolarProject_NYC.csv"
     
     # Read CSV into a DataFrame
     df = pd.read_csv(csv_path)
@@ -57,7 +57,7 @@ def main():
     gdf = gdf.to_crs(epsg=6539)
     
     # Export the GeoDataFrame to a GeoJSON file
-    output_geojson = "ExistingCommunitySolarProject_NYC.geojson"
+    output_geojson = "./output/ExistingCommunitySolarProject_NYC.geojson"
     gdf.to_file(output_geojson, driver="GeoJSON")
     print(f"GeoJSON exported successfully to {output_geojson}")
 
