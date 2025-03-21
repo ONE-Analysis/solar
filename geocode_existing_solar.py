@@ -19,8 +19,8 @@ def geocode_address(address, geolocator, delay=1):
     return None, None
 
 def main():
-    # Path to your CSV file
-    csv_path = r"./input/ExistingCommunitySolarProject_NYC.csv"
+    # Path to your CSV file (updated)
+    csv_path = r"./input/LL24_ConeyIsland_SolarProjects.csv"
     
     # Read CSV into a DataFrame
     df = pd.read_csv(csv_path)
@@ -31,8 +31,8 @@ def main():
     latitudes = []
     longitudes = []
     
-    # Loop through each address in the 'Site Address' column and geocode it
-    for address in df['Site Address']:
+    # Loop through each address in the 'Street' column and geocode it
+    for address in df['Street']:
         lat, lon = geocode_address(address, geolocator)
         latitudes.append(lat)
         longitudes.append(lon)
@@ -56,8 +56,8 @@ def main():
     # Reproject the GeoDataFrame to EPSG:6539
     gdf = gdf.to_crs(epsg=6539)
     
-    # Export the GeoDataFrame to a GeoJSON file
-    output_geojson = "./output/ExistingCommunitySolarProject_NYC.geojson"
+    # Export the GeoDataFrame to a GeoJSON file (updated)
+    output_geojson = "./output/ExistingSolarProjects_Coney.geojson"
     gdf.to_file(output_geojson, driver="GeoJSON")
     print(f"GeoJSON exported successfully to {output_geojson}")
 
